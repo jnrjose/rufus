@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * SMART HDD vs Flash detection - isHDD() tables
- * Copyright © 2013-2020 Pete Batard <pete@akeo.ie>
+ * Copyright © 2013-2023 Pete Batard <pete@akeo.ie>
  *
  * Based in part on drivedb.h from Smartmontools:
  * http://svn.code.sf.net/p/smartmontools/code/trunk/smartmontools/drivedb.h
@@ -90,7 +90,10 @@ static str_score_t str_score[] = {
 static str_score_t str_adjust[] = {
 	{ "Gadget", -10 },
 	{ "Flash", -10 },
+	{ "SD-CARD", -10 },
 	{ "HDD", +20 },
+	{ "SATA", +20 },
+	{ "SCSI", +20 },
 	{ "SSD", +20 }
 };
 
@@ -113,7 +116,7 @@ static vid_score_t vid_score[] = {
 	{ 0x0420, -5 },		// Chipsbank
 	{ 0x046d, -5 },		// Logitech
 	{ 0x0480, 5 },		// Toshiba
-	{ 0x048d, -5 },		// ITE
+	{ 0x048d, -10 },	// ITE
 	{ 0x04b4, 10 },		// Cypress
 	{ 0x04c5, 7 },		// Fujitsu
 	{ 0x04e8, 5 },		// Samsung
@@ -138,6 +141,7 @@ static vid_score_t vid_score[] = {
 	{ 0x09da, -5 },		// A4 Tech
 	{ 0x0b27, -5 },		// Ritek
 	{ 0x0bc2, 10 },		// Seagate
+	{ 0x0bda, -10 },	// Realtek
 	{ 0x0c76, -5 },		// JMTek
 	{ 0x0cf2, -5 },		// ENE
 	{ 0x0d49, 10 },		// Maxtor
@@ -168,6 +172,7 @@ static vid_score_t vid_score[] = {
 	{ 0x1f75, -2 },		// Innostor
 	{ 0x2001, -5 },		// Micov
 	{ 0x201e, -5 },		// Evdo
+	{ 0x2109, 10 },		// VIA Labs
 	{ 0x2188, -5 },		// SMI
 	{ 0x3538, -5 },		// PQI
 	{ 0x413c, -5 },		// Ameco
@@ -254,6 +259,7 @@ static vidpid_score_t vidpid_score[] = {
 	{ 0x059f, 0x1027, -20 },	// 16 GB UFD
 	{ 0x059f, 0x103B, -20 },	// 16 GB UFD
 	{ 0x059f, 0x1064, -20 },	// 16 GB UFD
+	{ 0x059f, 0x1079, -20 },	// LaCie XtremKey UFD
 	// Apple exceptions
 	{ 0x05ac, 0x8400, -20},
 	{ 0x05ac, 0x8401, -20},
@@ -263,8 +269,6 @@ static vidpid_score_t vidpid_score[] = {
 	{ 0x05ac, 0x8405, -20},
 	{ 0x05ac, 0x8406, -20},
 	{ 0x05ac, 0x8407, -20},
-	// No idea who these guys are. They don't exist in usb.ids.
-	{ 0x6557, 0x0021, -5},
 	// Prolific exceptions
 	{ 0x067b, 0x2506, -20 },	// 8 GB Micro Hard Drive
 	{ 0x067b, 0x2517, -20 },	// 1 GB UFD
@@ -297,4 +301,8 @@ static vidpid_score_t vidpid_score[] = {
 	{ 0x18a5, 0x3327, -20 },
 	// More Innostor
 	{ 0x1f75, 0x0917, -10 },	// Intenso Speed Line USB Device
+	// ??? (https://github.com/pbatard/rufus/issues/2247)
+	{ 0x23a9, 0xef18, -10 },
+	// No idea who these guys are. They don't exist in usb.ids.
+	{ 0x6557, 0x0021, -5 },
 };

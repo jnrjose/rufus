@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * PKI functions (code signing, etc.)
- * Copyright © 2015-2016 Pete Batard <pete@akeo.ie>
+ * Copyright © 2015-2024 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -48,17 +48,61 @@ const char* cert_name[3] = { "Akeo Consulting", "Akeo Systems", "Pete Batard" };
 const char* cert_country = "IE";
 
 typedef struct {
-	LPWSTR lpszProgramName;
-	LPWSTR lpszPublisherLink;
-	LPWSTR lpszMoreInfoLink;
+	LPWSTR      lpszProgramName;
+	LPWSTR      lpszPublisherLink;
+	LPWSTR      lpszMoreInfoLink;
 } SPROG_PUBLISHERINFO, *PSPROG_PUBLISHERINFO;
 
 // https://msdn.microsoft.com/en-us/library/ee442238.aspx
 typedef struct {
-	BLOBHEADER BlobHeader;
-	RSAPUBKEY  RsaHeader;
-	BYTE       Modulus[256];	// 2048 bit modulus
+	BLOBHEADER  BlobHeader;
+	RSAPUBKEY   RsaHeader;
+	BYTE        Modulus[256];	// 2048 bit modulus
 } RSA_2048_PUBKEY;
+
+// For PKCS7 WDAC Code Integrity processing
+#define PE256_HASHSIZE  32
+
+const GUID SKU_CODE_INTEGRITY_POLICY = { 0x976d12c8, 0xcb9f, 0x4730, { 0xbe, 0x52, 0x54, 0x60, 0x08, 0x43, 0x23, 0x8e} };
+
+typedef struct {
+	WORD        Nano;
+	WORD        Micro;
+	WORD        Minor;
+	WORD        Major;
+} CIVersion;
+
+typedef struct {
+	DWORD       PolicyFormatVersion;
+	GUID        PolicyTypeGUID;
+	GUID        PlatformGUID;
+	DWORD       OptionFlags;
+	DWORD       EKURuleEntryCount;
+	DWORD       FileRuleEntryCount;
+	DWORD       SignerRuleEntryCount;
+	DWORD       SignerScenarioEntryCount;
+	CIVersion   PolicyVersion;
+	DWORD       HeaderLength;
+} CIHeader;
+
+typedef struct {
+	DWORD       Type;
+	DWORD       FileNameLength;
+	WCHAR       FileName[0];
+} CIFileRuleHeader;
+
+typedef struct {
+	DWORD       Unknown;
+	CIVersion   Version;
+	DWORD       HashLength;
+	BYTE        Hash[0];
+} CIFileRuleData;
+
+enum {
+	CI_DENY = 0,
+	CI_ALLOW,
+	CI_FILE_ATTRIBUTES,
+};
 
 // The RSA public key modulus for the private key we use to sign the files on the server.
 // NOTE 1: This openssl modulus must be *REVERSED* to be usable with Microsoft APIs
@@ -192,12 +236,24 @@ const char* WinPKIErrorString(void)
 		return "None of the signers of the cryptographic message or certificate trust list is trusted.";
 	case CERT_E_UNTRUSTEDROOT:
 		return "The root certificate is not trusted.";
+	case TRUST_E_SYSTEM_ERROR:
+		return "A system-level error occurred while verifying trust.";
+	case TRUST_E_NO_SIGNER_CERT:
+		return "The certificate for the signer of the message is invalid or not found.";
+	case TRUST_E_COUNTER_SIGNER:
+		return "One of the counter signatures was invalid.";
+	case TRUST_E_CERT_SIGNATURE:
+		return "The signature of the certificate cannot be verified.";
+	case TRUST_E_TIME_STAMP:
+		return "The timestamp could not be verified.";
+	case TRUST_E_BAD_DIGEST:
+		return "The file content has been altered.";
+	case TRUST_E_BASIC_CONSTRAINTS:
+		return "A certificate's basic constraint extension has not been observed.";
 	case TRUST_E_NOSIGNATURE:
 		return "Not digitally signed.";
 	case TRUST_E_EXPLICIT_DISTRUST:
 		return "One of the certificates used was marked as untrusted by the user.";
-	case TRUST_E_TIME_STAMP:
-		return "The timestamp could not be verified.";
 	default:
 		static_sprintf(error_string, "Unknown PKI error 0x%08lX", error_code);
 		return error_string;
@@ -205,14 +261,13 @@ const char* WinPKIErrorString(void)
 }
 
 // Mostly from https://support.microsoft.com/en-us/kb/323809
-char* GetSignatureName(const char* path, const char* country_code)
+char* GetSignatureName(const char* path, const char* country_code, BOOL bSilent)
 {
 	static char szSubjectName[128];
 	char szCountry[3] = "__";
 	char *p = NULL, *mpath = NULL;
 	int i;
 	BOOL r;
-	HMODULE hm;
 	HCERTSTORE hStore = NULL;
 	HCRYPTMSG hMsg = NULL;
 	PCCERT_CONTEXT pCertContext = NULL;
@@ -228,12 +283,7 @@ char* GetSignatureName(const char* path, const char* country_code)
 		szFileName = calloc(MAX_PATH, sizeof(wchar_t));
 		if (szFileName == NULL)
 			return NULL;
-		hm = GetModuleHandle(NULL);
-		if (hm == NULL) {
-			uprintf("PKI: Could not get current executable handle: %s", WinPKIErrorString());
-			goto out;
-		}
-		dwSize = GetModuleFileNameW(hm, szFileName, MAX_PATH);
+		dwSize = GetModuleFileNameW(NULL, szFileName, MAX_PATH);
 		if ((dwSize == 0) || ((dwSize == MAX_PATH) && (GetLastError() == ERROR_INSUFFICIENT_BUFFER))) {
 			uprintf("PKI: Could not get module filename: %s", WinPKIErrorString());
 			goto out;
@@ -314,9 +364,9 @@ char* GetSignatureName(const char* path, const char* country_code)
 	}
 
 	if (szCountry[0] == '_')
-		uprintf("Binary executable is signed by '%s'", szSubjectName);
+		suprintf("Binary executable is signed by '%s'", szSubjectName);
 	else
-		uprintf("Binary executable is signed by '%s' (%s)", szSubjectName, szCountry);
+		suprintf("Binary executable is signed by '%s' (%s)", szSubjectName, szCountry);
 	p = szSubjectName;
 
 out:
@@ -533,14 +583,15 @@ uint64_t GetSignatureTimeStamp(const char* path)
 	timestamp = GetRFC3161TimeStamp(pSignerInfo);
 	if (timestamp)
 		uprintf("Note: '%s' has timestamp %s", (path==NULL)?mpath:path, TimestampToHumanReadable(timestamp));
-	// Because we are currently using both SHA-1 and SHA-256 signatures, we are in the very specific
-	// situation that Windows may say our executable passes Authenticode validation on Windows 7 or
-	// later (which includes timestamp validation) even if the SHA-1 signature or timestamps have
-	// been altered.
-	// This means that, if we don't also check the nested SHA-256 signature timestamp, an attacker
-	// could alter the SHA-1 one (which is the one we use by default for chronology validation) and
+	// Because we were using both SHA-1 and SHA-256 signatures during the SHA-256 transition, we were
+	// in the very specific situation where Windows could say that our executable passed Authenticode
+	// validation even if the SHA-1 signature or timestamps had been altered.
+	// This means that, unless we also check the nested signature timestamp, an attacker could alter
+	// the most vulnerable signature (which may also be the one used for chronology validation) and
 	// trick us into using an invalid timestamp value. To prevent this, we validate that, if we have
 	// both a regular and nested timestamp, they are within 60 seconds of each other.
+	// Even as we are no longer dual signing with two versions of SHA, we keep the code in case a
+	// major SHA-256 vulnerability is found and we have to go through a dual SHA again.
 	nested_timestamp = GetNestedRFC3161TimeStamp(pSignerInfo);
 	if (nested_timestamp)
 		uprintf("Note: '%s' has nested timestamp %s", (path==NULL)?mpath:path, TimestampToHumanReadable(nested_timestamp));
@@ -566,7 +617,7 @@ out:
 // From https://msdn.microsoft.com/en-us/library/windows/desktop/aa382384.aspx
 LONG ValidateSignature(HWND hDlg, const char* path)
 {
-	LONG r;
+	LONG r = TRUST_E_SYSTEM_ERROR;
 	WINTRUST_DATA trust_data = { 0 };
 	WINTRUST_FILE_INFO trust_file = { 0 };
 	GUID guid_generic_verify =	// WINTRUST_ACTION_GENERIC_VERIFY_V2
@@ -578,10 +629,11 @@ LONG ValidateSignature(HWND hDlg, const char* path)
 	// Check the signature name. Make it specific enough (i.e. don't simply check for "Akeo")
 	// so that, besides hacking our server, it'll place an extra hurdle on any malicious entity
 	// into also fooling a C.A. to issue a certificate that passes our test.
-	signature_name = GetSignatureName(path, cert_country);
+	signature_name = GetSignatureName(path, cert_country, (hDlg == INVALID_HANDLE_VALUE));
 	if (signature_name == NULL) {
 		uprintf("PKI: Could not get signature name");
-		MessageBoxExU(hDlg, lmprintf(MSG_284), lmprintf(MSG_283), MB_OK | MB_ICONERROR | MB_IS_RTL, selected_langid);
+		if (hDlg != INVALID_HANDLE_VALUE)
+			MessageBoxExU(hDlg, lmprintf(MSG_284), lmprintf(MSG_283), MB_OK | MB_ICONERROR | MB_IS_RTL, selected_langid);
 		return TRUST_E_NOSIGNATURE;
 	}
 	for (i = 0; i < ARRAYSIZE(cert_name); i++) {
@@ -590,8 +642,9 @@ LONG ValidateSignature(HWND hDlg, const char* path)
 	}
 	if (i >= ARRAYSIZE(cert_name)) {
 		uprintf("PKI: Signature '%s' is unexpected...", signature_name);
-		if (MessageBoxExU(hDlg, lmprintf(MSG_285, signature_name), lmprintf(MSG_283),
-			MB_YESNO | MB_ICONWARNING | MB_IS_RTL, selected_langid) != IDYES)
+		if ((hDlg == INVALID_HANDLE_VALUE) || (MessageBoxExU(hDlg,
+			lmprintf(MSG_285, signature_name), lmprintf(MSG_283),
+			MB_YESNO | MB_ICONWARNING | MB_IS_RTL, selected_langid) != IDYES))
 			return TRUST_E_EXPLICIT_DISTRUST;
 	}
 
@@ -599,7 +652,7 @@ LONG ValidateSignature(HWND hDlg, const char* path)
 	trust_file.pcwszFilePath = utf8_to_wchar(path);
 	if (trust_file.pcwszFilePath == NULL) {
 		uprintf("PKI: Unable to convert '%s' to UTF16", path);
-		return ERROR_SEVERITY_ERROR | FAC(FACILITY_CERT) | ERROR_NOT_ENOUGH_MEMORY;
+		return RUFUS_ERROR(ERROR_NOT_ENOUGH_MEMORY);
 	}
 
 	trust_data.cbStruct = sizeof(trust_data);
@@ -617,10 +670,15 @@ LONG ValidateSignature(HWND hDlg, const char* path)
 	trust_data.dwUnionChoice = WTD_CHOICE_FILE;
 	trust_data.pFile = &trust_file;
 
+	// NB: Calling this API will create DLL sideloading issues through 'msasn1.dll'.
+	// So make sure you delay-load 'wintrust.dll' in your application.
 	r = WinVerifyTrustEx(INVALID_HANDLE_VALUE, &guid_generic_verify, &trust_data);
 	safe_free(trust_file.pcwszFilePath);
 	switch (r) {
 	case ERROR_SUCCESS:
+		// hDlg = INVALID_HANDLE_VALUE is used when validating the Fido PS1 script
+		if (hDlg == INVALID_HANDLE_VALUE)
+			break;
 		// Verify that the timestamp of the downloaded update is in the future of our current one.
 		// This is done to prevent the use of an officially signed, but older binary, as potential attack vector.
 		current_ts = GetSignatureTimeStamp(NULL);
@@ -640,11 +698,13 @@ LONG ValidateSignature(HWND hDlg, const char* path)
 	case TRUST_E_NOSIGNATURE:
 		// Should already have been reported, but since we have a custom message for it...
 		uprintf("PKI: File does not appear to be signed: %s", WinPKIErrorString());
-		MessageBoxExU(hDlg, lmprintf(MSG_284), lmprintf(MSG_283), MB_OK | MB_ICONERROR | MB_IS_RTL, selected_langid);
+		if (hDlg != INVALID_HANDLE_VALUE)
+			MessageBoxExU(hDlg, lmprintf(MSG_284), lmprintf(MSG_283), MB_OK | MB_ICONERROR | MB_IS_RTL, selected_langid);
 		break;
 	default:
 		uprintf("PKI: Failed to validate signature: %s", WinPKIErrorString());
-		MessageBoxExU(hDlg, lmprintf(MSG_240), lmprintf(MSG_283), MB_OK | MB_ICONERROR | MB_IS_RTL, selected_langid);
+		if (hDlg != INVALID_HANDLE_VALUE)
+			MessageBoxExU(hDlg, lmprintf(MSG_240), lmprintf(MSG_283), MB_OK | MB_ICONERROR | MB_IS_RTL, selected_langid);
 		break;
 	}
 
@@ -729,5 +789,122 @@ out:
 		CryptDestroyHash(hHash);
 	if (hProv)
 		CryptReleaseContext(hProv, 0);
+	return r;
+}
+
+// The following SkuSiPolicy.p7b parsing code is derived from:
+// https://gist.github.com/mattifestation/92e545bf1ee5b68eeb71d254cec2f78e
+// by Matthew Graeber, with contributions by James Forshaw.
+BOOL ParseSKUSiPolicy(void)
+{
+	char path[MAX_PATH];
+	wchar_t* wpath = NULL;
+	BOOL r = FALSE;
+	DWORD i, dwEncoding, dwContentType, dwFormatType;
+	DWORD dwPolicySize = 0, dwBaseIndex = 0, dwSizeCount;
+	HCRYPTMSG hMsg = NULL;
+	CRYPT_DATA_BLOB pkcsData = { 0 };
+	DWORD* pdwEkuRules;
+	BYTE* pbRule;
+	CIHeader* Header;
+	CIFileRuleHeader* FileRuleHeader;
+	CIFileRuleData* FileRuleData;
+
+	pe256ssp_size = 0;
+	safe_free(pe256ssp);
+	// Must use sysnative for WOW
+	static_sprintf(path, "%s\\SecureBootUpdates\\SKUSiPolicy.p7b", sysnative_dir);
+	wpath = utf8_to_wchar(path);
+	if (wpath == NULL)
+		goto out;
+
+	r = CryptQueryObject(CERT_QUERY_OBJECT_FILE, wpath, CERT_QUERY_CONTENT_FLAG_ALL,
+		CERT_QUERY_FORMAT_FLAG_ALL, 0, &dwEncoding, &dwContentType, &dwFormatType, NULL,
+		&hMsg, NULL);
+	if (!r || dwContentType != CERT_QUERY_CONTENT_PKCS7_SIGNED)
+		goto out;
+
+	r = CryptMsgGetParam(hMsg, CMSG_CONTENT_PARAM, 0, NULL, &pkcsData.cbData);
+	if (!r || pkcsData.cbData == 0) {
+		uprintf("ParseSKUSiPolicy: Failed to retreive CMSG_CONTENT_PARAM size: %s", WindowsErrorString());
+		goto out;
+	}
+	pkcsData.pbData = malloc(pkcsData.cbData);
+	if (pkcsData.pbData == NULL)
+		goto out;
+	r = CryptMsgGetParam(hMsg, CMSG_CONTENT_PARAM, 0, pkcsData.pbData, &pkcsData.cbData);
+	if (!r) {
+		uprintf("ParseSKUSiPolicy: Failed to retreive CMSG_CONTENT_PARAM: %s", WindowsErrorString());
+		goto out;
+	}
+
+	// Now process the actual Security Policy content
+	if (pkcsData.pbData[0] == 4) {
+		dwPolicySize = pkcsData.pbData[1];
+		dwBaseIndex = 2;
+		if ((dwPolicySize & 0x80) == 0x80) {
+			dwSizeCount = dwPolicySize & 0x7F;
+			dwBaseIndex += dwSizeCount;
+			dwPolicySize = 0;
+			for (i = 0; i < dwSizeCount; i++) {
+				dwPolicySize = dwPolicySize << 8;
+				dwPolicySize = dwPolicySize | pkcsData.pbData[2 + i];
+			}
+		}
+	}
+
+	// Sanity checks
+	Header = (CIHeader*)&pkcsData.pbData[dwBaseIndex];
+	if (Header->HeaderLength + sizeof(uint32_t) != sizeof(CIHeader)) {
+		uprintf("ParseSKUSiPolicy: Unexpected Code Integrity Header size (0x%02x)", Header->HeaderLength);
+		goto out;
+	}
+	if (!CompareGUID(&Header->PolicyTypeGUID, &SKU_CODE_INTEGRITY_POLICY)) {
+		uprintf("ParseSKUSiPolicy: Unexpected Policy Type GUID %s", GuidToString(&Header->PolicyTypeGUID, TRUE));
+		goto out;
+	}
+
+	// Skip the EKU Rules
+	pdwEkuRules = (DWORD*) &pkcsData.pbData[dwBaseIndex + sizeof(CIHeader)];
+	for (i = 0; i < Header->EKURuleEntryCount; i++)
+		pdwEkuRules = &pdwEkuRules[(*pdwEkuRules + (2 * sizeof(DWORD) - 1)) / sizeof(DWORD)];
+
+	// Process the Files Rules
+	pbRule = (BYTE*)pdwEkuRules;
+	pe256ssp = malloc(Header->FileRuleEntryCount * PE256_HASHSIZE);
+	if (pe256ssp == NULL)
+		goto out;
+	for (i = 0; i < Header->FileRuleEntryCount; i++) {
+		FileRuleHeader = (CIFileRuleHeader*)pbRule;
+		pbRule = &pbRule[sizeof(CIFileRuleHeader)];
+		if (FileRuleHeader->FileNameLength != 0) {
+//			uprintf("%S", FileRuleHeader->FileName);
+			pbRule = &pbRule[((FileRuleHeader->FileNameLength + sizeof(DWORD) - 1) / sizeof(DWORD)) * sizeof(DWORD)];
+		}
+		FileRuleData = (CIFileRuleData*)pbRule;
+		if (FileRuleData->HashLength > 0x80) {
+			uprintf("ParseSKUSiPolicy: Unexpected hash length for entry %d (0x%02x)", i, FileRuleData->HashLength);
+			// We're probably screwed, so bail out
+			break;
+		}
+		//  We are only interested in 'DENY' type with PE256 hashes
+		if (FileRuleHeader->Type == CI_DENY && FileRuleData->HashLength == PE256_HASHSIZE) {
+			// Microsoft has the bad habit of duplicating entries - only add a hash if it's different from previous entry
+			if ((pe256ssp_size == 0) ||
+				(memcmp(&pe256ssp[(pe256ssp_size - 1) * PE256_HASHSIZE], FileRuleData->Hash, PE256_HASHSIZE) != 0)) {
+				memcpy(&pe256ssp[pe256ssp_size * PE256_HASHSIZE], FileRuleData->Hash, PE256_HASHSIZE);
+				pe256ssp_size++;
+			}
+		}
+		pbRule = &pbRule[sizeof(CIFileRuleData) + ((FileRuleData->HashLength + sizeof(DWORD) - 1) / sizeof(DWORD)) * sizeof(DWORD)];
+	}
+
+	r = TRUE;
+
+out:
+	if (hMsg != NULL)
+		CryptMsgClose(hMsg);
+	free(pkcsData.pbData);
+	free(wpath);
 	return r;
 }

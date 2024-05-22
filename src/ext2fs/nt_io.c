@@ -5,7 +5,7 @@
  *
  * Copyright (C) 1993, 1994, 1995 Theodore Ts'o.
  * Copyright (C) 1998 Andrey Shedel <andreys@ns.cr.cyco.com>
- * Copyright (C) 2018-2019 Pete Batard <pete@akeo.ie>
+ * Copyright (C) 2018-2024 Pete Batard <pete@akeo.ie>
  *
  * %Begin-Header%
  * This file may be redistributed under the terms of the GNU Library
@@ -81,7 +81,7 @@ static errcode_t nt_write_blk(io_channel channel, unsigned long block, int count
 static errcode_t nt_write_blk64(io_channel channel, unsigned long long block, int count, const void* data);
 static errcode_t nt_flush(io_channel channel);
 
-static struct struct_io_manager struct_nt_manager = {
+struct struct_io_manager struct_nt_manager = {
 	.magic		= EXT2_ET_MAGIC_IO_MANAGER,
 	.name		= "NT I/O Manager",
 	.open		= nt_open,
@@ -94,10 +94,7 @@ static struct struct_io_manager struct_nt_manager = {
 	.flush		= nt_flush
 };
 
-io_manager nt_io_manager(void)
-{
-	return &struct_nt_manager;
-}
+io_manager nt_io_manager = &struct_nt_manager;
 
 // Convert Win32 errors to unix errno
 typedef struct {
@@ -183,7 +180,7 @@ static __inline unsigned _MapNtStatus(IN NTSTATUS Status)
 // Return the last Windows Error
 DWORD ext2_last_winerror(DWORD default_error)
 {
-	return ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | (LastWinError ? LastWinError : default_error);
+	return RUFUS_ERROR(LastWinError ? LastWinError : default_error);
 }
 
 //
@@ -281,7 +278,7 @@ static __inline BOOLEAN _IsMounted(IN HANDLE Handle)
 {
 	IO_STATUS_BLOCK IoStatusBlock;
 	PF_INIT(NtFsControlFile, NtDll);
-	return (pfNtFsControlFile == NULL) ? STATUS_DLL_NOT_FOUND :
+	return (pfNtFsControlFile == NULL) ? FALSE :
 		(BOOLEAN)(pfNtFsControlFile(Handle, 0, 0, 0, &IoStatusBlock, FSCTL_IS_VOLUME_MOUNTED, 0, 0, 0, 0) == STATUS_SUCCESS);
 }
 
@@ -530,7 +527,7 @@ static errcode_t nt_open(const char *name, int flags, io_channel *channel)
 
 	// Initialize data
 	io->magic = EXT2_ET_MAGIC_IO_CHANNEL;
-	io->manager = nt_io_manager();
+	io->manager = nt_io_manager;
 	strcpy(io->name, name);
 	io->block_size = EXT2_MIN_BLOCK_SIZE;
 	io->refcount = 1;
